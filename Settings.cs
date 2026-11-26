@@ -25,6 +25,10 @@ namespace BlueprintCleaner
         [Name("Previous blueprint Key")]
         [Description("Displays the previous blueprint when stacked.")]
         public KeyCode leftKey = KeyCode.LeftArrow;
+
+        [Name("Debug logging")]
+        [Description("Writes stacking, cycling and scroll details to the MelonLoader log. Leave off unless troubleshooting.")]
+        public bool debugLog = false;
     }
     internal static class Settings
     {

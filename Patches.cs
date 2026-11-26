@@ -50,6 +50,87 @@ namespace BlueprintCleaner
         // --------------------------  CRAFTING PATCHES  ----------------------------- //
         /////////////////////////////////////////////////////////////////////////////////
 
+        // Blueprints are stacked by crafted result only (no crafting location in the key).
+        // Vanilla builds m_FilteredBlueprints for the current category/location filter first
+        // (ApplyFilter), then the ApplyFilter postfix collapses each stack to ONE member taken
+        // from the members vanilla actually listed. The chosen member therefore always belongs
+        // to the current view, and the row keeps the position of the stack's first member.
+
+        // Controlled by the "Debug logging" option in Mod Settings
+        private static bool DebugLog => Settings.settings != null && Settings.settings.debugLog;
+
+        // Blueprint name -> BlueprintData
+        public static System.Collections.Generic.Dictionary<string, BlueprintData> blueprintsByName = new System.Collections.Generic.Dictionary<string, BlueprintData>();
+
+        // Stack key -> members vanilla listed in the last ApplyFilter pass (used by the [n/m] label and the arrow keys)
+        public static System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<string>> lastVisible = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<string>>();
+
+        // Separator used in the label, e.g. "Gunpowder [2/4 · Forge]"
+        private const string LocationSeparator = " · ";
+
+        // Stack key for a blueprint: crafted result name only
+        public static string? GetResultKey(BlueprintData bpi)
+        {
+            if (bpi == null) return null;
+            if (bpi.m_CraftedResultDecoration != null) return bpi.m_CraftedResultDecoration.name;
+            if (bpi.m_CraftedResultGear != null) return bpi.m_CraftedResultGear.name;
+            return null;
+        }
+
+        // Active pick if listed, then a member craftable at the current location, then the first listed
+        public static string PickChosen(Panel_Crafting panel, string key, System.Collections.Generic.List<string> visible)
+        {
+            if (visible.Count == 0) return "";
+
+            string active = activeBlueprint.ContainsKey(key) ? activeBlueprint[key] : "";
+            if (visible.Contains(active)) return active;
+
+            CraftingLocation here = panel.GetCurrentCraftingLocation();
+            foreach (string name in visible)
+            {
+                if (blueprintsByName.TryGetValue(name, out BlueprintData bp) && bp != null && bp.CanCraftAtLocation(here)) return name;
+            }
+
+            return visible[0];
+        }
+
+        public static string GetLocationLabel(CraftingLocation location)
+        {
+            switch (location)
+            {
+                case CraftingLocation.Anywhere: return "Anywhere";
+                case CraftingLocation.Workbench: return "Workbench";
+                case CraftingLocation.Forge: return "Forge";
+                case CraftingLocation.AmmoWorkbench: return "Ammo Workbench";
+                case CraftingLocation.Fire: return "Fire";
+                case CraftingLocation.FurnitureWorkbench: return "Furniture Workbench";
+                default: return location.ToString();
+            }
+        }
+
+        // Cycle the selected stack through the members visible in the current view (dir = +1 / -1)
+        public static void CycleStack(Panel_Crafting panel, int dir)
+        {
+            BlueprintData bpi = panel.SelectedBPI;
+            string? key = GetResultKey(bpi);
+            if (key == null || !activeBlueprint.ContainsKey(key)) return;
+
+            if (!lastVisible.TryGetValue(key, out var visible) || visible.Count < 2) return;
+
+            int index = visible.IndexOf(bpi.name);
+            if (index < 0) index = 0;
+            int next = (index + dir + visible.Count) % visible.Count;
+
+            activeBlueprint[key] = visible[next];
+            lastBlueprintSelected = visible[next];
+
+            // Keep the list where it is (same mechanism as hide/show); restored in the OnCategoryChanged postfix
+            scrollValue = panel.m_ScrollBehaviour.m_ScrollBar.scrollValue;
+            if (DebugLog) MelonLogger.Msg($"[BlueprintCleaner] Cycle {key} -> {visible[next]}, scroll before = {scrollValue}, index = {panel.m_ScrollBehaviour.SelectedIndex}");
+
+            panel.OnCategoryChanged(panel.m_CategoryNavigation.m_CurrentIndex);
+        }
+
         [HarmonyPatch(typeof(BlueprintManager), nameof(BlueprintManager.LoadAddressableBlueprints))]
         internal static class BlueprintManager_LoadAddressableBlueprints
         {
@@ -60,21 +141,17 @@ namespace BlueprintCleaner
 
                 blueprintDuplicates.Clear();
                 activeBlueprint.Clear();
+                blueprintsByName.Clear();
+                lastVisible.Clear();
 
                 foreach (BlueprintData bpi in __instance.m_AllBlueprints)
                 {
-                    string? itemName = null;
-
+                    if (bpi == null) continue;
                     if (bpi.name == "BLUEPRINT_GEAR_NoiseMaker_A") continue;
 
-                    if (bpi.m_CraftedResultDecoration != null)
-                    {
-                        itemName = bpi.m_CraftedResultDecoration.name + bpi.m_RequiredCraftingLocation.ToString();
-                    }
-                    else if (bpi.m_CraftedResultGear != null)
-                    {
-                        itemName = bpi.m_CraftedResultGear.name + bpi.m_RequiredCraftingLocation.ToString();
-                    }
+                    blueprintsByName[bpi.name] = bpi;
+
+                    string? itemName = GetResultKey(bpi);
 
                     if (itemName != null)
                     {
@@ -128,11 +205,126 @@ namespace BlueprintCleaner
                     blueprintDuplicates[key] = new Il2CppSystem.Collections.Generic.List<string>();
                 }
 
-                // Log the final dictionary content for debugging
                 foreach (var pair in blueprintDuplicates)
                 {
                     //populate activeBlueprint dictionary with the first blueprints for each item
                     activeBlueprint[pair.Key] = pair.Value != null && pair.Value.Count > 0 ? pair.Value[0] : "";
+                }
+            }
+        }
+
+        // Collapses each stack in the list vanilla just built.
+        // Priority.First so this runs before other mods' ApplyFilter postfixes (e.g. CraftingSearch).
+        [HarmonyPatch(typeof(Panel_Crafting), nameof(Panel_Crafting.ApplyFilter))]
+        internal static class Panel_Crafting_ApplyFilter
+        {
+            [HarmonyPriority(Priority.First)]
+            private static void Postfix(Panel_Crafting __instance)
+            {
+                lastVisible.Clear();
+
+                // SKIP 
+                if (Main.vanillaDisplay) return;
+
+                Il2CppSystem.Collections.Generic.List<BlueprintData> filtered = __instance.m_FilteredBlueprints;
+                if (filtered == null || filtered.Count == 0) return;
+
+                // 1. Members of each stack that vanilla listed, in list order
+                var visible = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<string>>();
+                for (int i = 0; i < filtered.Count; i++)
+                {
+                    BlueprintData bpi = filtered[i];
+                    if (bpi == null) continue;
+
+                    string? key = GetResultKey(bpi);
+                    if (key == null || !blueprintDuplicates.ContainsKey(key)) continue;
+
+                    if (!visible.TryGetValue(key, out var members))
+                    {
+                        members = new System.Collections.Generic.List<string>();
+                        visible[key] = members;
+                    }
+                    members.Add(bpi.name);
+                }
+
+                if (visible.Count == 0) return;
+
+                // 2. One member per stack
+                var chosen = new System.Collections.Generic.Dictionary<string, string>();
+                foreach (var pair in visible)
+                {
+                    chosen[pair.Key] = PickChosen(__instance, pair.Key, pair.Value);
+                }
+
+                // 3. Rebuild the list: the chosen member takes the slot of the stack's first listed member
+                var result = new System.Collections.Generic.List<BlueprintData>(filtered.Count);
+                var emitted = new System.Collections.Generic.HashSet<string>();
+                bool changed = false;
+
+                for (int i = 0; i < filtered.Count; i++)
+                {
+                    BlueprintData bpi = filtered[i];
+                    string? key = bpi != null ? GetResultKey(bpi) : null;
+
+                    if (key == null || !chosen.ContainsKey(key))
+                    {
+                        result.Add(bpi!);
+                        continue;
+                    }
+
+                    if (emitted.Contains(key))
+                    {
+                        changed = true; // other members of the stack are dropped
+                        continue;
+                    }
+                    emitted.Add(key);
+
+                    BlueprintData pick = bpi!;
+                    if (blueprintsByName.TryGetValue(chosen[key], out BlueprintData chosenData) && chosenData != null)
+                    {
+                        pick = chosenData;
+                    }
+                    if (pick.name != bpi!.name) changed = true;
+                    result.Add(pick);
+                }
+
+                foreach (var pair in visible) lastVisible[pair.Key] = pair.Value;
+
+                if (DebugLog)
+                {
+                    MelonLogger.Msg($"[BlueprintCleaner] ApplyFilter: filter = {__instance.m_CurrentFilter}, location = {__instance.GetCurrentCraftingLocation()}, rows {filtered.Count} -> {result.Count}");
+                    foreach (var pair in visible)
+                    {
+                        var parts = new System.Collections.Generic.List<string>();
+                        foreach (string name in pair.Value)
+                        {
+                            string loc = blueprintsByName.TryGetValue(name, out BlueprintData d) && d != null ? d.m_RequiredCraftingLocation.ToString() : "?";
+                            parts.Add($"{name} ({loc})");
+                        }
+                        MelonLogger.Msg($"[BlueprintCleaner]   {pair.Key}: shown = {chosen[pair.Key]}, listed = {string.Join(", ", parts)}");
+                    }
+                }
+
+                if (!changed)
+                {
+                    // Same rows, but the [n/m] labels may have been built before lastVisible was updated
+                    if (__instance.m_ScrollBehaviour != null) __instance.m_ScrollBehaviour.RefreshItems();
+                    return;
+                }
+
+                filtered.Clear();
+                foreach (BlueprintData bpi in result) filtered.Add(bpi);
+
+                // Vanilla may already have built the rows for the uncollapsed list
+                ScrollBehaviour sb = __instance.m_ScrollBehaviour;
+                if (sb != null)
+                {
+                    sb.RebuildItems(filtered.Count);
+                    if (filtered.Count > 0)
+                    {
+                        int index = Math.Clamp(sb.SelectedIndex, 0, filtered.Count - 1);
+                        sb.SetSelectedIndex(index, true, false);
+                    }
                 }
             }
         }
@@ -145,50 +337,10 @@ namespace BlueprintCleaner
                 // SKIP 
                 if (Main.vanillaDisplay) return;
 
-                if (__result)
+                // Hidden blueprints are removed here; stacks are collapsed in the ApplyFilter postfix
+                if (__result && bpi != null && Main.blueprintsRemoved.Contains(bpi.name))
                 {
-                    if (bpi.m_CraftedResultDecoration != null)
-                    {
-                        string resultName = bpi.m_CraftedResultDecoration.name + bpi.m_RequiredCraftingLocation.ToString();
-                        string blueprintName = bpi.name;
-
-                        if (blueprintDuplicates.ContainsKey(resultName))
-                        {
-                            if (activeBlueprint[resultName] == blueprintName)
-                            {
-                                __result = true;
-                            }
-                            else
-                            {
-                                __result = false;
-                            }
-                        }
-                        else if (Main.blueprintsRemoved.Contains(blueprintName))
-                        {
-                            __result = false;
-                        }
-                    }
-                    else if (bpi.m_CraftedResultGear != null)
-                    {
-                        string resultName = bpi.m_CraftedResultGear.name + bpi.m_RequiredCraftingLocation.ToString();
-                        string blueprintName = bpi.name;
-
-                        if (blueprintDuplicates.ContainsKey(resultName))
-                        {
-                            if (activeBlueprint[resultName] == blueprintName)
-                            {
-                                __result = true;
-                            }
-                            else
-                            {
-                                __result = false;
-                            }
-                        }
-                        else if (Main.blueprintsRemoved.Contains(blueprintName))
-                        {
-                            __result = false;
-                        }
-                    }
+                    __result = false;
                 }
             }
         }
@@ -211,134 +363,27 @@ namespace BlueprintCleaner
 
                 if (InputManager.GetKeyDown(InputManager.m_CurrentContext, Settings.settings.rightKey))
                 {
-                    if (__instance.SelectedBPI.m_CraftedResultDecoration != null)
-                    {
-                        string resultName = __instance.SelectedBPI.m_CraftedResultDecoration.name + __instance.SelectedBPI.m_RequiredCraftingLocation.ToString();
-                        string blueprintName = __instance.SelectedBPI.name;
-                        int blueprintIndex = 0;
-
-                        if (activeBlueprint.ContainsKey(resultName))
-                        {
-                            int blueprintCount = blueprintDuplicates[resultName].Count;
-
-                            for (int i = 0; i < blueprintCount; i++)
-                            {
-                                if (blueprintDuplicates[resultName][i] == blueprintName) blueprintIndex = i;
-                            }
-
-                            if (blueprintIndex == blueprintCount - 1)
-                            {
-                                activeBlueprint[resultName] = blueprintDuplicates[resultName][0];
-                            }
-                            else
-                            {
-                                activeBlueprint[resultName] = blueprintDuplicates[resultName][blueprintIndex + 1];
-                            }
-
-                            lastBlueprintSelected = activeBlueprint[resultName];
-                            __instance.OnCategoryChanged(__instance.m_CategoryNavigation.m_CurrentIndex);
-                        }
-                    }
-                    else if (__instance.SelectedBPI.m_CraftedResultGear != null)
-                    {
-                        string resultName = __instance.SelectedBPI.m_CraftedResultGear.name + __instance.SelectedBPI.m_RequiredCraftingLocation.ToString();
-                        string blueprintName = __instance.SelectedBPI.name;
-                        int blueprintIndex = 0;
-
-                        if (activeBlueprint.ContainsKey(resultName))
-                        {
-                            int blueprintCount = blueprintDuplicates[resultName].Count;
-
-                            for (int i = 0; i < blueprintCount; i++)
-                            {
-                                if (blueprintDuplicates[resultName][i] == blueprintName) blueprintIndex = i;
-                            }
-
-                            if (blueprintIndex == blueprintCount - 1)
-                            {
-                                activeBlueprint[resultName] = blueprintDuplicates[resultName][0];
-                            }
-                            else
-                            {
-                                activeBlueprint[resultName] = blueprintDuplicates[resultName][blueprintIndex + 1];
-                            }
-
-                            lastBlueprintSelected = activeBlueprint[resultName];
-                            __instance.OnCategoryChanged(__instance.m_CategoryNavigation.m_CurrentIndex);
-                        }
-                    }
+                    CycleStack(__instance, 1);
                 }
                 else if (InputManager.GetKeyDown(InputManager.m_CurrentContext, Settings.settings.leftKey))
                 {
-                    if (__instance.SelectedBPI.m_CraftedResultDecoration != null)
-                    {
-                        string resultName = __instance.SelectedBPI.m_CraftedResultDecoration.name + __instance.SelectedBPI.m_RequiredCraftingLocation.ToString();
-                        string blueprintName = __instance.SelectedBPI.name;
-                        int blueprintIndex = 0;
-
-                        if (activeBlueprint.ContainsKey(resultName))
-                        {
-                            int blueprintCount = blueprintDuplicates[resultName].Count;
-
-                            for (int i = 0; i < blueprintCount; i++)
-                            {
-                                if (blueprintDuplicates[resultName][i] == blueprintName) blueprintIndex = i;
-                            }
-
-                            if (blueprintIndex == 0)
-                            {
-                                activeBlueprint[resultName] = blueprintDuplicates[resultName][blueprintCount - 1];
-                            }
-                            else
-                            {
-                                activeBlueprint[resultName] = blueprintDuplicates[resultName][blueprintIndex - 1];
-                            }
-
-                            lastBlueprintSelected = activeBlueprint[resultName];
-                            __instance.OnCategoryChanged(__instance.m_CategoryNavigation.m_CurrentIndex);
-                        }
-                    }
-                    else if (__instance.SelectedBPI.m_CraftedResultGear != null)
-                    {
-                        string resultName = __instance.SelectedBPI.m_CraftedResultGear.name + __instance.SelectedBPI.m_RequiredCraftingLocation.ToString();
-                        string blueprintName = __instance.SelectedBPI.name;
-                        int blueprintIndex = 0;
-
-                        if (activeBlueprint.ContainsKey(resultName))
-                        {
-                            int blueprintCount = blueprintDuplicates[resultName].Count;
-
-                            for (int i = 0; i < blueprintCount; i++)
-                            {
-                                if (blueprintDuplicates[resultName][i] == blueprintName) blueprintIndex = i;
-                            }
-
-                            if (blueprintIndex == 0)
-                            {
-                                activeBlueprint[resultName] = blueprintDuplicates[resultName][blueprintCount - 1];
-                            }
-                            else
-                            {
-                                activeBlueprint[resultName] = blueprintDuplicates[resultName][blueprintIndex - 1];
-                            }
-
-                            lastBlueprintSelected = activeBlueprint[resultName];
-                            __instance.OnCategoryChanged(__instance.m_CategoryNavigation.m_CurrentIndex);
-                        }
-                    }
+                    CycleStack(__instance, -1);
                 }
             }
         }
+
         // This patch will allow to keep the blueprint selected
         [HarmonyPatch(typeof(Panel_Crafting), nameof(Panel_Crafting.OnCategoryChanged))]
         internal static class Panel_Crafting_OnCategoryChanged
         {
             private static void Postfix(Panel_Crafting __instance)
             {
-                if (scrollValue != null)
+                float? restoreScroll = scrollValue;
+                scrollValue = null;
+
+                if (restoreScroll != null)
                 {
-                    __instance.m_ScrollBehaviour.m_ScrollBar.scrollValue = (float)scrollValue;
-                    scrollValue = null;
+                    __instance.m_ScrollBehaviour.m_ScrollBar.scrollValue = (float)restoreScroll;
                 }
 
                 if (lastBlueprintSelected != null)
@@ -349,12 +394,18 @@ namespace BlueprintCleaner
                         if (bpi.name == lastBlueprintSelected)
                         {
                             __instance.m_ScrollBehaviour.SetSelectedIndex(i, true, true);
-                            lastBlueprintSelected = null;
-                            return;
+                            break;
                         }
                         i = i + 1;
                     }
                     lastBlueprintSelected = null;
+                }
+
+                // SetSelectedIndex can scroll the row to the edge of the window; put the list back where it was
+                if (restoreScroll != null)
+                {
+                    if (DebugLog) MelonLogger.Msg($"[BlueprintCleaner] OnCategoryChanged: scroll after select = {__instance.m_ScrollBehaviour.m_ScrollBar.scrollValue}, restoring {restoreScroll}");
+                    __instance.m_ScrollBehaviour.m_ScrollBar.scrollValue = (float)restoreScroll;
                 }
             }
         }
@@ -386,40 +437,43 @@ namespace BlueprintCleaner
                 // SKIP 
                 if (Main.vanillaDisplay) return;
 
-                int rank = 0;
-                int i = 0;
+                string? resultName = GetResultKey(__instance);
+                if (resultName == null || !blueprintDuplicates.ContainsKey(resultName)) return;
 
-                if (__instance.m_CraftedResultDecoration != null)
+                // Count only the members visible in the current view; fall back to the whole stack
+                System.Collections.Generic.List<string> members;
+                if (!lastVisible.TryGetValue(resultName, out members))
                 {
-                    string decoName = __instance.m_CraftedResultDecoration.name + __instance.m_RequiredCraftingLocation.ToString();
-                    if (blueprintDuplicates.ContainsKey(decoName))
+                    members = new System.Collections.Generic.List<string>();
+                    if (blueprintDuplicates[resultName] != null)
                     {
-                        foreach (string blueprint in blueprintDuplicates[decoName])
-                        {
-                            i += 1;
-                            if (__instance.name == blueprint)
-                            {
-                                rank = i;
-                            }
-                        }
-                        __result += $" [{rank}/{i}]";
+                        foreach (string blueprint in blueprintDuplicates[resultName]) members.Add(blueprint);
                     }
                 }
-                else if (__instance.m_CraftedResultGear != null)
+
+                if (members.Count < 2) return;
+
+                int rank = members.IndexOf(__instance.name) + 1;
+
+                // Show the location only when the stack mixes crafting locations
+                bool mixedLocations = false;
+                foreach (string blueprint in members)
                 {
-                    string gearName = __instance.m_CraftedResultGear.name + __instance.m_RequiredCraftingLocation.ToString();
-                    if (blueprintDuplicates.ContainsKey(gearName))
+                    if (blueprintsByName.TryGetValue(blueprint, out BlueprintData other) && other != null
+                        && other.m_RequiredCraftingLocation != __instance.m_RequiredCraftingLocation)
                     {
-                        foreach (string blueprint in blueprintDuplicates[gearName])
-                        {
-                            i += 1;
-                            if (__instance.name == blueprint)
-                            {
-                                rank = i;
-                            }
-                        }
-                        __result += $" [{rank}/{i}]";
+                        mixedLocations = true;
+                        break;
                     }
+                }
+
+                if (mixedLocations)
+                {
+                    __result += $" [{rank}/{members.Count}{LocationSeparator}{GetLocationLabel(__instance.m_RequiredCraftingLocation)}]";
+                }
+                else
+                {
+                    __result += $" [{rank}/{members.Count}]";
                 }
             }
         }
@@ -434,80 +488,40 @@ namespace BlueprintCleaner
                     if (__instance.m_BlueprintData != null)
                     {
                         string blueprintName = __instance.m_BlueprintData.name;
+                        string? resultName = GetResultKey(__instance.m_BlueprintData);
                         Panel_Crafting panel = InterfaceManager.GetPanel<Panel_Crafting>();
                         scrollValue = panel.m_ScrollBehaviour.m_ScrollBar.scrollValue;
 
                         if (Main.blueprintsRemoved.Contains(blueprintName))
                         {
                             Main.blueprintsRemoved.Remove(blueprintName);
-                            if (__instance.m_BlueprintData.m_CraftedResultDecoration != null)
+                            if (resultName != null && blueprintDuplicates.ContainsKey(resultName))
                             {
-                                string resultName = __instance.m_BlueprintData.m_CraftedResultDecoration.name + __instance.m_BlueprintData.m_RequiredCraftingLocation.ToString();
-                                if (blueprintDuplicates.ContainsKey(resultName))
+                                if (blueprintDuplicates[resultName] == null || blueprintDuplicates[resultName].Count == 0)
                                 {
-                                    if (blueprintDuplicates[resultName] == null || blueprintDuplicates[resultName].Count == 0)
-                                    {
-                                        blueprintDuplicates[resultName] = new Il2CppSystem.Collections.Generic.List<string>();
-                                        blueprintDuplicates[resultName].Add(blueprintName);
-                                    }
-                                    else
-                                    {
-                                        blueprintDuplicates[resultName].Add(blueprintName);
-                                    }
+                                    blueprintDuplicates[resultName] = new Il2CppSystem.Collections.Generic.List<string>();
                                 }
-                            }
-                            else if (__instance.m_BlueprintData.m_CraftedResultGear != null)
-                            {
-                                string resultName = __instance.m_BlueprintData.m_CraftedResultGear.name + __instance.m_BlueprintData.m_RequiredCraftingLocation.ToString();
-                                if (blueprintDuplicates.ContainsKey(resultName))
+
+                                if (!blueprintDuplicates[resultName].Contains(blueprintName))
                                 {
-                                    if (blueprintDuplicates[resultName] == null || blueprintDuplicates[resultName].Count == 0)
-                                    {
-                                        blueprintDuplicates[resultName] = new Il2CppSystem.Collections.Generic.List<string>();
-                                        blueprintDuplicates[resultName].Add(blueprintName);
-                                        activeBlueprint[resultName] = blueprintDuplicates[resultName][0];
-                                    }
-                                    else
-                                    {
-                                        blueprintDuplicates[resultName].Add(blueprintName);
-                                        activeBlueprint[resultName] = blueprintDuplicates[resultName][0];
-                                    }
+                                    blueprintDuplicates[resultName].Add(blueprintName);
                                 }
+                                activeBlueprint[resultName] = blueprintDuplicates[resultName][0];
                             }
                         }
                         else
                         {
                             Main.blueprintsRemoved.Add(blueprintName);
-                            if (__instance.m_BlueprintData.m_CraftedResultDecoration != null)
+                            if (resultName != null && blueprintDuplicates.ContainsKey(resultName))
                             {
-                                string resultName = __instance.m_BlueprintData.m_CraftedResultDecoration.name + __instance.m_BlueprintData.m_RequiredCraftingLocation.ToString();
-                                if (blueprintDuplicates.ContainsKey(resultName))
+                                blueprintDuplicates[resultName].Remove(blueprintName);
+                                if (blueprintDuplicates[resultName] == null || blueprintDuplicates[resultName].Count == 0)
                                 {
-                                    blueprintDuplicates[resultName].Remove(blueprintName);
-                                    if (blueprintDuplicates[resultName] == null || blueprintDuplicates[resultName].Count == 0)
-                                    {
-                                        activeBlueprint[resultName] = "";
-                                    }
-                                    else
-                                    {
-                                        activeBlueprint[resultName] = blueprintDuplicates[resultName][0];
-                                    }
+                                    activeBlueprint[resultName] = "";
                                 }
-                            }
-                            else if (__instance.m_BlueprintData.m_CraftedResultGear != null)
-                            {
-                                string resultName = __instance.m_BlueprintData.m_CraftedResultGear.name + __instance.m_BlueprintData.m_RequiredCraftingLocation.ToString();
-                                if (blueprintDuplicates.ContainsKey(resultName))
+                                else
                                 {
-                                    blueprintDuplicates[resultName].Remove(blueprintName);
-                                    if (blueprintDuplicates[resultName] == null || blueprintDuplicates[resultName].Count == 0)
-                                    {
-                                        activeBlueprint[resultName] = "";
-                                    }
-                                    else
-                                    {
-                                        activeBlueprint[resultName] = blueprintDuplicates[resultName][0];
-                                    }
+                                    activeBlueprint[resultName] = blueprintDuplicates[resultName][0];
                                 }
                             }
                         }
